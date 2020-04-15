@@ -25,7 +25,7 @@ class SharedGpfa:
         self.dtype = dtype
         self.vars = dict()
         self.init_vars()
-        # self.init_joint()
+        self.init_joint()
 
 
     def init_vars(self):
@@ -40,7 +40,7 @@ class SharedGpfa:
         self.vars['subject_noise_scale'] = tfp.util.TransformedVariable(init_log(self.m), constrain_positive, name='subject_noise_scale')
         self.vars['roi_noise_scale'] = tfp.util.TransformedVariable(init_log(self.q), constrain_positive, name='roi_noise_scale')
         
-        # self.vars['x'] = tf.Variable(init_uniform((self.p, self.t)), name='x')
+        self.vars['x'] = tf.Variable(init_uniform((self.p, self.t)), name='x')
         
 
     def init_joint(self):
