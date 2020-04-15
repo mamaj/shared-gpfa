@@ -21,7 +21,7 @@ class SharedGpfa:
         self.reg = reg
         self.t = None
         self.latent_noise_var = latent_noise_var
-        self.amplitude = 1 - latent_noise_var
+        self.amplitude = np.sqrt(1 - latent_noise_var)
         self.dtype = dtype
         self.vars = dict()
         self.joint = []
@@ -34,13 +34,13 @@ class SharedGpfa:
 
         constrain_positive = tfb.Shift(np.finfo(np.float32).tiny)(tfb.Exp())
 
-        self.vars['w'] = tf.Variable(init_uniform((self.m, self.q, self.p)), name='w')
+        self.vars['w'] = tf.Variable(init_norm((self.m, self.q, self.p)), name='w')
         self.vars['length_scale'] = tfp.util.TransformedVariable(init_log((self.p)), constrain_positive, name='length_scale')
         self.vars['subject_noise_scale'] = tfp.util.TransformedVariable(init_log(self.m), constrain_positive, name='subject_noise_scale')
         self.vars['roi_noise_scale'] = tfp.util.TransformedVariable(init_log(self.q), constrain_positive, name='roi_noise_scale')
         self.vars['x'] = []
         for i, t in enumerate(self.t):
-            x = tf.Variable(init_uniform((self.p, t)), name='x{i}')
+            x = tf.Variable(init_norm((self.p, t)), name='x{i}')
             self.vars['x'].append(x)
 
 
@@ -49,7 +49,8 @@ class SharedGpfa:
         for t in self.t:
             self.joint.append(self.create_joint(t))
 
-
+    
+    # needs checking
     def create_joint(self, t):
         ind_points = np.arange(t).astype(self.dtype)
         joint = tfd.JointDistributionNamed(dict(
@@ -89,7 +90,7 @@ class SharedGpfa:
         return self.reg * tf.reduce_mean(tf.abs(self.vars['w']))
 
 
-    def fit(self, train_data, n_iters, learning_rate=0.01, tensorboard=True, only_train_x=False, **kwargs):
+    def fit(self, train_data, n_iters, learning_rate=0.01, tensorboard=False, **kwargs):
         
         train_data = self.add_batch(train_data)
         self.t = [s.shape[-1] for s in train_data]
@@ -98,11 +99,11 @@ class SharedGpfa:
         
         opt = tf.optimizers.Adam(learning_rate=learning_rate)
         if tensorboard: self.setup_tfboard()
-        trainable_vars = self.get_trainable_vars(only_train_x)
+        trainable_vars = self.get_trainable_vars()
 
         @tf.function
         def loss():
-            return - self.log_prob(train_data) / (sum(self.t) * (self.p + self.q * self.m)) 
+            return -self.log_prob(train_data) / (sum(self.t) * (self.p + self.q * self.m)) 
             + self.l1_loss()
 
         @tf.function
@@ -117,28 +118,30 @@ class SharedGpfa:
         return l
 
 
-    def add_video(self, obs, n_iters=1e3, learning_rate=0.04, name='new_x', **kwargs):
+    def add_video(self, obs, n_iters=1e3, learning_rate=0.04, name='new_x', tensorboard=False, **kwargs):
 
         obs = self.add_batch(obs)
         t = [s.shape[-1] for s in obs]
 
         new_joint = [self.create_joint(_t) for _t in t]
-        init_uniform = lambda size: np.random.uniform(size=size).astype(self.dtype)
+        init = lambda size: np.random.normal(size=size).astype(self.dtype)
         xlist = []
         for i, _t in enumerate(t):
-            x = tf.Variable(init_uniform((self.p, _t)), name=name+f'_{i}')
+            x = tf.Variable(init((self.p, _t)), name=name+f'_{i}')
             xlist.append(x)
+
+        if tensorboard: self.setup_tfboard()
 
         opt = tf.optimizers.Adam(learning_rate=learning_rate)
 
         @tf.function
         def loss():
-            return - self.log_prob(obs, new_joint, xlist) / (sum(t) * (self.p + self.q * self.m)) 
+            return -self.log_prob(obs, new_joint, xlist) / (sum(t) * (self.p + self.q * self.m)) 
             + self.l1_loss()
 
         @tf.function
         def recon_loss():
-            return tf.reduce_sum([tf.reduce_sum((_obs - self.vars['w'] @ x) ** 2) for _obs, x in zip(obs, xlist)])
+            return tf.reduce_sum([tf.reduce_sum((_obs - self.vars['w'] @ _x) ** 2) for _obs, _x in zip(obs, xlist)])
 
         @tf.function
         def train_step():
@@ -147,6 +150,13 @@ class SharedGpfa:
         # l = []
         for epoch in tqdm(range(int(n_iters)), **kwargs):
             train_step()
+            if tensorboard: 
+                self.update_tfsummary(loss(), epoch)
+                with self.summary_writer.as_default():
+                    for i, x in enumerate(xlist):
+                        tf.summary.histogram(f'xlist{i}_0', x[0], step=epoch)
+                        tf.summary.histogram(f'xlist{i}_1', x[1], step=epoch)
+
             # l.append(loss())
         return xlist, recon_loss()
 
