@@ -50,14 +50,11 @@ tf.get_logger().setLevel('INFO')
 
 # Other Videos for validation
 
-train, _, _ = load_ea_data(vid=0)
-test, _, _ = load_ea_data(vid=1)
+train = [load_ea_data(vid=v)[0] for v in [0, 1, 2, 3, 4, 5]]
+m, q, _ = train[0].shape
+test, _, _ = [load_ea_data(vid=v)[0] for v in [6, 7, 8]]
 
-m, q, t_train = train.shape
-_, _, t_test = test.shape
-
-p_range = np.arange(2, 200, 2)
-# p_range = np.array([5, 10, 20])
+p_range = np.arange(5, 200, 5)
 
 error = []
 lscales = []
@@ -70,11 +67,11 @@ plt.ion()
 plt.show()
 
 for i, p in enumerate(tqdm(p_range, desc='total', ncols=100)):
-    model = SharedGpfa(m, q, p, t_train)
+    model = SharedGpfa(m, q, p, reg=0.)
     model.fit(
         train_data=train, 
-        n_iters=2000, 
-        learning_rate=0.05, 
+        n_iters=1200, 
+        learning_rate=0.075, 
         tensorboard=False,
         desc=f'p = {p}',
         ncols=100
@@ -84,8 +81,8 @@ for i, p in enumerate(tqdm(p_range, desc='total', ncols=100)):
     lscales.append(length_scale)
     axs.ravel()[i].bar(np.arange(model.p), length_scale)
 
-    x = model.add_video(test)
-    recon_error = tf.reduce_sum((test - model.vars['w'] @ x) ** 2)
+    x, recon_error = model.add_video(test)
+    # recon_error = tf.reduce_sum((test - model.vars['w'] @ x) ** 2)
     error.append(recon_error)
     np.save('error', error)
     np.save('lscale', lscales)

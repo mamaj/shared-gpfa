@@ -14,21 +14,20 @@ dtype = np.float32
 
 class SharedGpfa:
 
-    def __init__(self, m, q, p, t, latent_noise_var=1e-4, dtype=np.float32, reg=0.):
+    def __init__(self, m, q, p, latent_noise_var=1e-4, dtype=np.float32, reg=0.):
         self.m = m
         self.q = q
         self.p = p
-        self.t = t
         self.reg = reg
+        self.t = None
         self.latent_noise_var = latent_noise_var
         self.amplitude = 1 - latent_noise_var
         self.dtype = dtype
         self.vars = dict()
-        self.init_vars()
-        self.init_joint()
-
+        self.joint = []
 
     def init_vars(self):
+        self.check_model_fit()
         init_log = lambda size: np.random.lognormal(size=size).astype(self.dtype)
         init_norm = lambda size: np.random.normal(size=size).astype(self.dtype)
         init_uniform = lambda size: np.random.uniform(size=size).astype(self.dtype)
@@ -39,12 +38,16 @@ class SharedGpfa:
         self.vars['length_scale'] = tfp.util.TransformedVariable(init_log((self.p)), constrain_positive, name='length_scale')
         self.vars['subject_noise_scale'] = tfp.util.TransformedVariable(init_log(self.m), constrain_positive, name='subject_noise_scale')
         self.vars['roi_noise_scale'] = tfp.util.TransformedVariable(init_log(self.q), constrain_positive, name='roi_noise_scale')
-        
-        self.vars['x'] = tf.Variable(init_uniform((self.p, self.t)), name='x')
-        
+        self.vars['x'] = []
+        for i, t in enumerate(self.t):
+            x = tf.Variable(init_uniform((self.p, t)), name='x{i}')
+            self.vars['x'].append(x)
+
 
     def init_joint(self):
-        self.joint = self.create_joint(self.t)
+        self.check_model_fit()
+        for t in self.t:
+            self.joint.append(self.create_joint(t))
 
 
     def create_joint(self, t):
@@ -66,51 +69,90 @@ class SharedGpfa:
         return joint
 
 
-    def log_prob(self, data):
-        log_prob = self.joint.log_prob(dict(
-            x = self.vars['x'],
-            obs = data
-        ))
-        return tf.reduce_mean(log_prob)
+    def log_prob(self, data, joint=None, x=None):
+        self.check_model_fit()
+        if joint is None: joint = self.joint
+        if x is None: x = self.vars['x']
+        data = self.add_batch(data)
+
+        log_prob = []
+        for _joint, _x, _data in zip(joint, x, data):
+            log_prob.append(
+                _joint.log_prob(dict(
+                    x = _x,
+                    obs = _data
+            )))
+        return tf.reduce_sum(log_prob)
 
 
     def l1_loss(self):
         return self.reg * tf.reduce_mean(tf.abs(self.vars['w']))
 
 
-    def fit(self, train_data, n_iters, learning_rate=0.01, tensorboard=True, **kwargs):
+    def fit(self, train_data, n_iters, learning_rate=0.01, tensorboard=True, only_train_x=False, **kwargs):
+        
+        train_data = self.add_batch(train_data)
+        self.t = [s.shape[-1] for s in train_data]
+        self.init_vars()
+        self.init_joint()
+        
         opt = tf.optimizers.Adam(learning_rate=learning_rate)
+        if tensorboard: self.setup_tfboard()
+        trainable_vars = self.get_trainable_vars(only_train_x)
 
         @tf.function
         def loss():
-            return -self.log_prob(train_data) / (self.m * self.t * self.q * self.p) + self.l1_loss()
+            return - self.log_prob(train_data) / (sum(self.t) * (self.p + self.q * self.m)) 
+            + self.l1_loss()
 
         @tf.function
         def train_step():
             opt.minimize(loss, trainable_vars)
 
-        trainable_vars = [self.vars[t].trainable_variables[0] for t in ('length_scale', 'subject_noise_scale', 'roi_noise_scale')]
-        trainable_vars += [self.vars[t] for t in ('x', 'w')]
-
-        if tensorboard:
-            summary_writer = self.setup_tfboard()
         l = []
         for epoch in tqdm(range(int(n_iters)), **kwargs):
             train_step()
             l.append(loss())
-            if tensorboard:
-                with summary_writer.as_default():
-                    tf.summary.scalar('loss', l[-1], step=epoch)
-                    tf.summary.histogram('w0', self.vars['w'][0], step=epoch)
-                    tf.summary.histogram('w1', self.vars['w'][1], step=epoch)
-                    tf.summary.histogram('x0', self.vars['x'][0], step=epoch)
-                    tf.summary.histogram('x1', self.vars['x'][1], step=epoch)
-                    tf.summary.scalar('lenscale0', self.vars['length_scale'][0], step=epoch)
-                    tf.summary.scalar('lenscale1', self.vars['length_scale'][1], step=epoch)
+            if tensorboard: self.update_tfsummary(l[-1], epoch)
         return l
 
 
-    def add_subject(self, obs, n_iters=1e3, learning_rate=0.04, name='w_new'):
+    def add_video(self, obs, n_iters=1e3, learning_rate=0.04, name='new_x', **kwargs):
+
+        obs = self.add_batch(obs)
+        t = [s.shape[-1] for s in obs]
+
+        new_joint = [self.create_joint(_t) for _t in t]
+        init_uniform = lambda size: np.random.uniform(size=size).astype(self.dtype)
+        xlist = []
+        for i, _t in enumerate(t):
+            x = tf.Variable(init_uniform((self.p, _t)), name=name+f'_{i}')
+            xlist.append(x)
+
+        opt = tf.optimizers.Adam(learning_rate=learning_rate)
+
+        @tf.function
+        def loss():
+            return - self.log_prob(obs, new_joint, xlist) / (sum(t) * (self.p + self.q * self.m)) 
+            + self.l1_loss()
+
+        @tf.function
+        def recon_loss():
+            return tf.reduce_sum([tf.reduce_sum((_obs - self.vars['w'] @ x) ** 2) for _obs, x in zip(obs, xlist)])
+
+        @tf.function
+        def train_step():
+            opt.minimize(loss, xlist)
+
+        # l = []
+        for epoch in tqdm(range(int(n_iters)), **kwargs):
+            train_step()
+            # l.append(loss())
+        return xlist, recon_loss()
+
+
+
+    def add_subject(self, obs, experiment, n_iters=1e3, learning_rate=0.04, name='w_new'):
         if obs.ndim == 2:
             obs = np.expand_dims(obs, 0)
         init_norm = lambda size: np.random.normal(size=size).astype(self.dtype)
@@ -119,7 +161,7 @@ class SharedGpfa:
 
         @tf.function
         def loss():
-            return tf.reduce_sum((obs - w @ self.vars['x']) ** 2)
+            return tf.reduce_sum((obs - w @ self.vars['x'][experiment]) ** 2)
             
         @tf.function
         def train_step():
@@ -130,47 +172,39 @@ class SharedGpfa:
         return w, loss()
 
 
-    def add_video(self, obs, n_iters=1e3, learning_rate=0.04, name='new_x'):
-
-        assert obs.shape[-2] == self.q, "number of observation timeseries does not match."
-        assert obs.shape[-3] == self.m, "number of observation subjects does not match."
-        
-        t = obs.shape[-1]
-
-        init_uniform = lambda size: np.random.uniform(size=size).astype(self.dtype)
-        x = tf.Variable(init_uniform((self.p, t)), name=name)
-        new_joint = self.create_joint(t)
-        opt = tf.optimizers.Adam(learning_rate=learning_rate)
-
-        @tf.function
-        def loss():
-            log_prob = new_joint.log_prob(dict(
-                x = x,
-                obs = obs
-            ))
-            return -log_prob
-            
-        @tf.function
-        def train_step():
-            opt.minimize(loss, (x))
-
-        @tf.function
-        def recon_loss():
-            return tf.reduce_sum((obs - self.vars['w'] @ x) ** 2)
-
-        l = []
-        for i in tqdm(range(int(n_iters))):
-            train_step()
-            l.append(loss())
-        return x, np.array(l)
-
-
     def setup_tfboard(self):
         current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         train_log_dir = './logs/' + current_time
-        return tf.summary.create_file_writer(train_log_dir)
+        self.summary_writer =  tf.summary.create_file_writer(train_log_dir)
 
 
+    def update_tfsummary(self, loss, epoch):
+        with self.summary_writer.as_default():
+            tf.summary.scalar('loss', loss, step=epoch)
+            tf.summary.histogram('w0', self.vars['w'][0], step=epoch)
+            tf.summary.histogram('w1', self.vars['w'][1], step=epoch)
+            tf.summary.scalar('lenscale0', self.vars['length_scale'][0], step=epoch)
+            tf.summary.scalar('lenscale1', self.vars['length_scale'][1], step=epoch)
+            for i, x in enumerate(self.vars['x']):
+                tf.summary.histogram(f'x{i}_0', x[0], step=epoch)
+                tf.summary.histogram(f'x{i}_1', x[1], step=epoch)
+    
+
+    def get_trainable_vars(self, only_train_x=False):
+        trainable_vars = []
+        trainable_vars += self.vars['x']
+        if not only_train_x:
+            trainable_vars += [self.vars[t].trainable_variables[0] for t in ('length_scale', 'subject_noise_scale', 'roi_noise_scale')]
+            trainable_vars.append(self.vars['w'])
+        return trainable_vars
 
 
+    def check_model_fit(self):
+        assert self.t is not None, "model.fit() is not passed yet"
 
+
+    def add_batch(self, data):
+        if type(data) is not list and data.ndim == 3:
+            return [data]
+        else:
+            return data
