@@ -7,6 +7,7 @@ import pandas as pd
 import tensorflow as tf
 import tensorflow_probability as tfp
 from tqdm import tqdm
+import math
 
 tfd = tfp.distributions
 tfb = tfp.bijectors
@@ -21,7 +22,7 @@ class SharedGpfa:
         self.reg = reg
         self.t = None
         self.latent_noise_var = latent_noise_var
-        self.amplitude = np.sqrt(1 - latent_noise_var)
+        self.amplitude = math.sqrt(1 - latent_noise_var)
         self.dtype = dtype
         self.vars = dict()
         self.joint = []
@@ -51,7 +52,8 @@ class SharedGpfa:
 
     
     # needs checking
-    def create_joint(self, t):
+    def create_joint(self, t, subs=Ellipsis):
+
         ind_points = np.arange(t).astype(self.dtype)
         joint = tfd.JointDistributionNamed(dict(
             x = tfd.Independent(tfd.GaussianProcess(
@@ -63,8 +65,8 @@ class SharedGpfa:
             ), 1),
             obs = lambda x:
                 tfd.Independent(tfd.Normal(
-                    loc = tf.matmul(self.vars['w'], tf.expand_dims(x, -3)),
-                    scale = tf.expand_dims(tf.expand_dims(self.vars['subject_noise_scale'], -1) * self.vars['roi_noise_scale'] , -1)
+                    loc = tf.matmul(self.vars['w'][subs], tf.expand_dims(x, -3)),
+                    scale = tf.expand_dims(tf.expand_dims(self.vars['subject_noise_scale'][subs], -1) * self.vars['roi_noise_scale'] , -1)
                 ), 3)
         ))
         return joint
@@ -118,12 +120,17 @@ class SharedGpfa:
         return l
 
 
-    def add_video(self, obs, n_iters=1e3, learning_rate=0.04, name='new_x', tensorboard=False, **kwargs):
+    def add_video(self, obs, n_iters=1e3, learning_rate=0.04, subs=Ellipsis, name='new_x', tensorboard=False, **kwargs):
 
+        if subs is None: subs = range(self.m)
         obs = self.add_batch(obs)
-        t = [s.shape[-1] for s in obs]
+        obs_subs = []
+        for s in obs:
+            obs_subs.append(s[subs])
+        t = [s.shape[-1] for s in obs_subs]
 
-        new_joint = [self.create_joint(_t) for _t in t]
+
+        new_joint = [self.create_joint(_t, subs=subs) for _t in t]
         init = lambda size: np.random.normal(size=size).astype(self.dtype)
         xlist = []
         for i, _t in enumerate(t):
@@ -136,12 +143,12 @@ class SharedGpfa:
 
         @tf.function
         def loss():
-            return -self.log_prob(obs, new_joint, xlist) / (sum(t) * (self.p + self.q * self.m)) 
+            return -self.log_prob(obs_subs, new_joint, xlist) / (sum(t) * (self.p + self.q * self.m)) 
             + self.l1_loss()
 
         @tf.function
         def recon_loss():
-            return tf.reduce_sum([tf.reduce_sum((_obs - self.vars['w'] @ _x) ** 2) for _obs, _x in zip(obs, xlist)])
+            return tf.reduce_sum([tf.reduce_sum((_obs - self.vars['w'][subs] @ _x) ** 2) for _obs, _x in zip(obs_subs, xlist)])
 
         @tf.function
         def train_step():
