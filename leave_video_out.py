@@ -37,7 +37,7 @@ plt.ion()
 plt.show()
 
 for i, p in enumerate(tqdm(p_range, desc='total', ncols=100)):
-    model = SharedGpfa(m, q, p, reg=0.)
+    model = SharedGpfa(m, q, p, reg=0., fa_init = True)
     model.fit(
         train_data=train, 
         n_iters=1200, 
