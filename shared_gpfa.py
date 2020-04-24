@@ -18,18 +18,16 @@ dtype = np.float32
 
 class SharedGpfa:
 
-    def __init__(self, m, q, p, latent_noise_var=1e-4, dtype=np.float32, reg=0., fa_init=False):
+    def __init__(self, m, q, p, latent_noise_var=1e-4, dtype=np.float32):
         self.m = m
         self.q = q
         self.p = p
-        self.reg = reg
         self.t = None
         self.latent_noise_var = latent_noise_var
         self.amplitude = math.sqrt(1 - latent_noise_var)
         self.dtype = dtype
         self.vars = dict()
         self.joint = []
-        self.fa_init = fa_init
 
     def init_vars(self):
         self.check_model_fit()
@@ -62,8 +60,13 @@ class SharedGpfa:
         )
         self.vars['x'] = []
         for i, t in enumerate(self.t):
-            x = tf.Variable(init_norm((self.p, t)), name='x{i}')
+            x = tf.Variable(init_uniform((self.p, t)), name='x{i}')
             self.vars['x'].append(x)
+        self.vars['amplitude'] = tfp.util.TransformedVariable(
+            init_log(self.p), 
+            constrain_positive, 
+            name='amplitude'
+        )
 
     def init_joint(self):
         self.check_model_fit()
@@ -76,8 +79,10 @@ class SharedGpfa:
         joint = tfd.JointDistributionNamed(dict(
             x = tfd.Independent(tfd.GaussianProcess(
                 kernel = tfp.math.psd_kernels.ExponentiatedQuadratic(
-                    self.amplitude, self.vars['length_scale'],
-                    feature_ndims=1
+                    amplitude = self.amplitude,
+                    # amplitude = self.vars['amplitude'], 
+                    length_scale = self.vars['length_scale'],
+                    feature_ndims = 1
                 ),
                 index_points = ind_points[:, None],
                 jitter = 1e-4,
@@ -92,6 +97,38 @@ class SharedGpfa:
                 ), 3)
         ))
         return joint
+
+
+    def create_joint_reg(self, t, reg, subs=Ellipsis):
+        ind_points = np.arange(t).astype(self.dtype)
+        joint = tfd.JointDistributionNamed(dict(
+            
+            x = tfd.Independent(tfd.GaussianProcess(
+                kernel = tfp.math.psd_kernels.ExponentiatedQuadratic(
+                    amplitude = self.vars['amplitude'],
+                    length_scale = self.vars['length_scale'],
+                    feature_ndims = 1
+                ),
+                index_points = ind_points[:, None],
+                jitter = 1e-4,
+                observation_noise_variance = self.latent_noise_var,
+                validate_args = True
+            ), 1),
+
+            w = tfd.Independent(tfd.Laplace(
+                loc = tf.zeros(self.vars['w'].shape),
+                scale = 1 / reg
+            )),
+
+            obs = lambda x, w:
+                tfd.Independent(tfd.Normal(
+                    loc = tf.matmul(w[subs], tf.expand_dims(x, -3)),
+                    scale = tf.expand_dims(tf.expand_dims(
+                        self.vars['subject_noise_scale'][subs], -1) * self.vars['roi_noise_scale'], -1)
+                ), 3)
+        ))
+        return joint
+
 
     def log_prob(self, data, joint=None, x=None):
         self.check_model_fit()
@@ -111,14 +148,14 @@ class SharedGpfa:
         return tf.reduce_sum(log_prob)
 
     def l1_loss(self):
-        return self.reg * tf.reduce_mean(tf.abs(self.vars['w']))
+        return tf.reduce_mean(tf.abs(self.vars['w']))
 
-    def fit(self, train_data, n_iters, learning_rate=0.01, tensorboard=False, **kwargs):
+    def fit(self, train_data, n_iters, learning_rate=0.01, reg=0., tensorboard=False, fa_init=True, **kwargs):
 
         train_data = self.add_batch(train_data)
         self.t = [s.shape[-1] for s in train_data]
         self.init_vars()
-        if self.fa_init:
+        if fa_init:
             self.assign_fa(train_data)
         self.init_joint()
 
@@ -130,7 +167,7 @@ class SharedGpfa:
         @tf.function
         def loss():
             return -self.log_prob(train_data) / (sum(self.t) * (self.p + self.q * self.m))
-            + self.l1_loss()
+            + reg * self.l1_loss()
 
         @tf.function
         def train_step():
@@ -141,15 +178,13 @@ class SharedGpfa:
             train_step()
             l.append(loss())
             if tensorboard:
-                self.update_tfsummary(l[-1], epoch)
+                self.update_tfsummary(loss(), epoch)
         return l
 
-    def add_video(self, obs, n_iters=1e3, learning_rate=0.04, subs=Ellipsis, name='new_x', tensorboard=False, fa_init=None, **kwargs):
+    def add_video(self, obs, n_iters=1e3, learning_rate=0.04, subs=Ellipsis, name='new_x', tensorboard=False, fa_init=True, **kwargs):
 
         if subs is None:
             subs = range(self.m)
-        if fa_init is None:
-            fa_init = self.fa_init
 
         obs = self.add_batch(obs)
         obs_subs = []
@@ -161,8 +196,7 @@ class SharedGpfa:
         if fa_init:
             xlist_pinv = self.least_square(obs)
         else:
-            def init(size): return np.random.normal(
-                size=size).astype(self.dtype)
+            def init(size): return np.random.normal(size=size).astype(self.dtype)
 
         xlist = []
         for i, _t in enumerate(t):
@@ -233,8 +267,9 @@ class SharedGpfa:
 
         x = fa.fit_transform(y)
 
+        split_ind = np.cumsum([d.shape[-1] for d in data])[:-1]
         x = x.transpose()
-        x = np.array_split(x, [data[0].shape[-1]], axis=-1)
+        x = np.array_split(x, split_ind, axis=-1)
         w = fa.components_.transpose()
         w = np.split(w, data[0].shape[0])
         w = np.stack(w, axis=0)
@@ -271,21 +306,28 @@ class SharedGpfa:
             tf.summary.scalar('loss', loss, step=epoch)
             tf.summary.histogram('w0', self.vars['w'][0], step=epoch)
             tf.summary.histogram('w1', self.vars['w'][1], step=epoch)
-            tf.summary.scalar(
-                'lenscale0', self.vars['length_scale'][0], step=epoch)
-            tf.summary.scalar(
-                'lenscale1', self.vars['length_scale'][1], step=epoch)
+            tf.summary.histogram('lenth_scale', self.vars['length_scale'], step=epoch)
             for i, x in enumerate(self.vars['x']):
-                tf.summary.histogram(f'x{i}_0', x[0], step=epoch)
-                tf.summary.histogram(f'x{i}_1', x[1], step=epoch)
+                tf.summary.histogram(f'x_sample{i}_0', x[0], step=epoch)
+                tf.summary.histogram(f'x_sample{i}_1', x[1], step=epoch)
+            for i, lenscale in enumerate(self.vars['length_scale']):
+                tf.summary.scalar(f'lenth_scale_{i}',lenscale, step=epoch)
+            # tf.summary.scalar('lenscale0', self.vars['length_scale'][0], step=epoch)
+            # tf.summary.scalar('lenscale1', self.vars['length_scale'][1], step=epoch)
 
     def get_trainable_vars(self, only_train_x=False):
         trainable_vars = []
         trainable_vars += self.vars['x']
         if not only_train_x:
-            trainable_vars += [self.vars[t].trainable_variables[0]
-                               for t in ('length_scale', 'subject_noise_scale', 'roi_noise_scale')]
             trainable_vars.append(self.vars['w'])
+            transformed_vars = (
+                'length_scale', 
+                'subject_noise_scale', 
+                'roi_noise_scale'
+                # 'amplitude'
+            )
+            for v in transformed_vars:
+                trainable_vars.append(self.vars[v].trainable_variables[0])
         return trainable_vars
 
     def check_model_fit(self):
