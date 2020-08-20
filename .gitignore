@@ -1,7 +1,3 @@
 __pycache__
-.vscode/*
-logs/*
-Figures/
-raider/
+.vscode/
 .ipynb_checkpoints/
-experiment_results/
