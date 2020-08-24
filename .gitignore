@@ -2,5 +2,7 @@ __pycache__
 .vscode/
 .ipynb_checkpoints/
 /sherlock_h5_data
-Sherlock_processed.zip
+*Sherlock_processed.zip
 /raider
+/Sherlock_processed
+
