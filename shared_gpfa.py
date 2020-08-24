@@ -232,7 +232,7 @@ class SharedGpfa:
             smoothness = (self.m * self.q / self.p) / sm_factor
             
         obs = self.add_batch(obs)
-        assert obs[0].shape[:-1] == (self.m, self.q)
+#         assert obs[0].shape[:-1] == (self.m, self.q), f"obs: {obs[0].shape}, (m = {self.m}, q = {self.q}))"
 
         t = [x.shape[-1] for x in obs]
         new_joint = [self.create_joint(_t) for _t in t]

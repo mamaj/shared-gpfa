@@ -1,3 +1,6 @@
 __pycache__
 .vscode/
 .ipynb_checkpoints/
+/sherlock_h5_data
+/Sherlock_processed
+/raider

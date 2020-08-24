@@ -1,11 +1,11 @@
 import numpy as np
-import brainiak.funcalign.srm
+from brainiak.funcalign import srm, rsrm
 
 def SRM(*args, **kwargs):
-    return srm_factory(brainiak.funcalign.srm.SRM)(*args, name='SSRM', **kwargs)
+    return srm_factory(srm.SRM)(*args, name='SSRM', **kwargs)
 
 def RSRM(*args, **kwargs):
-    return srm_factory(brainiak.funcalign.srm.RSRM)(*args, name='RSRM', **kwargs)
+    return srm_factory(rsrm.RSRM)(*args, name='RSRM', **kwargs)
 
 def srm_factory(base):
     
