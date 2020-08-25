@@ -31,18 +31,13 @@ class SharedGpfa:
 
     def init_vars(self):
         self.check_model_fit()
-        
         def init_log(size):
             return np.random.lognormal(size=size).astype(self.dtype)
-        
         def init_norm(size):
             return np.random.normal(size=size).astype(self.dtype)
-        
         def init_uniform(size):
             return np.random.uniform(size=size).astype(self.dtype)
-        
         constrain_positive = tfb.Shift(np.finfo(np.float32).tiny)(tfb.Exp())
-
         self.vars['w'] = tf.Variable(
             init_uniform((self.m, self.q, self.p)),
             name='w')
@@ -83,13 +78,11 @@ class SharedGpfa:
                     observation_noise_variance=self.latent_noise_var,
                     validate_args=True),
                 reinterpreted_batch_ndims=1),
-            
             w=tfd.Independent(
                 tfd.Normal(
                     loc=np.zeros((self.m, self.q, self.p), dtype=self.dtype),
                     scale=1),
                 reinterpreted_batch_ndims=3),
-            
             obs=lambda x, w:
                 tfd.Independent(
                     tfd.Normal(
@@ -105,7 +98,6 @@ class SharedGpfa:
             return self.create_joint(t)
         elif type(subs) is int:
             subs = [subs]
-
         ind_points = np.arange(t).astype(self.dtype)
         joint = tfd.JointDistributionNamed(dict(
             x=tfd.Independent(
@@ -119,13 +111,11 @@ class SharedGpfa:
                     observation_noise_variance=self.latent_noise_var,
                     validate_args=True),
                 reinterpreted_batch_ndims=1),
-            
             w=tfd.Independent(
                 tfd.Normal(
                     loc=np.zeros((len(subs), self.q, self.p), dtype=self.dtype),
                     scale=1),
                 reinterpreted_batch_ndims=3),
-            
             obs=lambda x, w:
                 tfd.Independent(tfd.Normal(
                     loc=tf.matmul(w, tf.expand_dims(x, -3)),
@@ -144,7 +134,8 @@ class SharedGpfa:
         if w is None:
             w = self.vars['w']
         data = self.add_batch(data)
-        x = self.add_batch(x)
+        x = self.add_batch(x, element_len=2)
+        assert(len(joint) == len(x) == len(data))
         
         log_prob = []
         for _joint, _x, _data in zip(joint, x, data):
@@ -165,10 +156,9 @@ class SharedGpfa:
         if w is None:
             w = self.vars['w']
         data = self.add_batch(data)
-        x = self.add_batch(x)
+        x = self.add_batch(x, element_len=2)
         
         log_prob_x = []
-#         log_prob_w = []
         log_prob_obs = []
         for _joint, _x, _data in zip(joint, x, data):
             log_prob = _joint.log_prob_parts(dict(
@@ -176,14 +166,12 @@ class SharedGpfa:
                 w=w,
                 obs=_data))
             log_prob_x.append(log_prob['x'])
-#             log_prob_w.append(log_prob['w'])
             log_prob_obs.append(log_prob['obs'])
-            
         return {'x': tf.reduce_sum(log_prob_x),
                 'w': log_prob['w'],
                 'obs': tf.reduce_sum(log_prob_obs)}
 
-    def train_loss(self, data, reg, smoothness, joint=None, x=None, w=None, normalize=True):
+    def train_loss(self, data, smoothness, reg=1, joint=None, x=None, w=None, normalize=True):
         log_prob = self.log_prob_parts(data, joint, x, w)
         loss = log_prob['obs'] + smoothness * log_prob['x'] + reg * log_prob['w']
         if normalize:
@@ -191,13 +179,12 @@ class SharedGpfa:
             t = [d.shape[-1] for d in data]
             normalizer = sum(t) * (self.p + self.q * m)
         else:
-            normalizer = 1
+            normalizer = 1.0
         return -loss / normalizer
 
-    def fit(self, train_data, n_iters, learning_rate=.01, tensorboard=False, fa_init=True, smoothness=1, reg=1, sm_factor=None, desc='fitting SGPFA', **kwargs):
+    def fit(self, train_data, n_iters, learning_rate=.01, tensorboard=False, fa_init=False, smoothness=1, reg=1, sm_factor=None, desc='fitting SGPFA', **kwargs):
         if sm_factor is not None:
             smoothness = (self.m * self.q / self.p) / sm_factor
-            print(smoothness)
         train_data = self.add_batch(train_data)
         self.t = [s.shape[-1] for s in train_data]
         self.init_vars()
@@ -226,13 +213,11 @@ class SharedGpfa:
                 self.update_tfsummary(loss(), epoch)
         return l
 
-    def add_video(self, obs, smoothness=1, sm_factor=None, n_iters=1e3, learning_rate=0.04, ls_init=True, name='new_x', tensorboard=False, desc='Adding Video', **kwargs):
-
+    def add_video(self, obs, smoothness=1, sm_factor=None, n_iters=1e3, learning_rate=0.04, ls_init=False, name='new_x', tensorboard=False, desc='Adding Video', **kwargs):
         if sm_factor is not None:
             smoothness = (self.m * self.q / self.p) / sm_factor
-            
         obs = self.add_batch(obs)
-#         assert obs[0].shape[:-1] == (self.m, self.q), f"obs: {obs[0].shape}, (m = {self.m}, q = {self.q}))"
+        assert obs[0].shape[:-1] == (self.m, self.q), f"obs: {obs[0].shape}, (m = {self.m}, q = {self.q}))"
 
         t = [x.shape[-1] for x in obs]
         new_joint = [self.create_joint(_t) for _t in t]
@@ -242,7 +227,6 @@ class SharedGpfa:
         else:
             def init(size):
                 return np.random.uniform(size=size).astype(self.dtype)
-
         xlist = []
         for i, _t in enumerate(t):
             if ls_init:
@@ -274,17 +258,16 @@ class SharedGpfa:
                         tf.summary.histogram(f'xlist{i}_1', x[1], step=epoch)
         return xlist
 
-    def add_video_subjects(self, obs, smoothness=1, sm_factor=None, n_iters=1e3, learning_rate=0.04, ls_init=True, subs=Ellipsis, name='new_x', tensorboard=False, desc='Adding Video', **kwargs):
-
+    def add_video_subjects(self, obs, subs, smoothness=1, sm_factor=None, n_iters=1e3, learning_rate=0.04, ls_init=False, name='new_x', tensorboard=False, desc='Adding Video', **kwargs):
         if type(subs) is int:
             subs = [subs]
+        elif subs is Ellipsis:
+            return self.add_video(**locals())
         obs = self.add_batch(obs)
-        assert len(subs) == len(obs[0])
-        
+        assert obs[0].shape[:-1] == (len(subs), self.q), f"obs: {obs[0].shape}, (len(subs) = {len(subs)}, q = {self.q}))"
         if sm_factor is not None:
             smoothness = (len(subs) * self.q / self.p) / sm_factor
-
-
+            
         t = [x.shape[-1] for x in obs]
         new_joint = [self.create_joint_subjects(_t, subs=subs) for _t in t]
 
@@ -309,7 +292,7 @@ class SharedGpfa:
 
         @tf.function
         def loss():
-            return self.train_loss(obs, reg=1, smoothness=smoothness, joint=new_joint, x=xlist, w=self.vars['w'][subs])
+            return self.train_loss(obs, reg=1, smoothness=smoothness, joint=new_joint, x=xlist, w=tf.gather(self.vars['w'], subs))
 
         @tf.function
         def train_step():
@@ -325,7 +308,8 @@ class SharedGpfa:
                         tf.summary.histogram(f'xlist{i}_1', x[1], step=epoch)
         return xlist
 
-    def add_subject(self, obs, video=0, reg=1, solve_ls=True, add_to_model=False, n_iters=1e3, learning_rate=0.04, name='w_new'):
+    # needs a complete rewrite
+    def add_subject(self, obs, video=0, reg=1, solve_ls=True, add_to_model=False, n_iters=1e3, learning_rate=0.04, name='new_sub'):
         if obs.ndim == 2:
             obs = np.expand_dims(obs, 0)
 
@@ -335,22 +319,42 @@ class SharedGpfa:
             w = obs @ X.T @ np.linalg.inv((X @ X.T + reg * np.eye(self.p)))
 
         else:
-            return None
-            # def init_norm(size):
-            #     return np.random.normal(size=size).astype(self.dtype)
-            # w = tf.Variable(init_norm((obs.shape[0], self.q, self.p)), name=name)
-            # opt = tf.optimizers.Adam(learning_rate=learning_rate)
+            def init_norm(size):
+                return np.random.normal(size=size).astype(self.dtype)
+            
+            def joint_model(t):
+                ind_points = np.arange(t).astype(self.dtype)
+                joint = tfd.JointDistributionNamed(dict(
+                    w=tfd.Independent(
+                        tfd.Normal(
+                            loc=np.zeros((len(subs), self.q, self.p), dtype=self.dtype),
+                            scale=1),
+                        reinterpreted_batch_ndims=3),
 
-            # @tf.function
-            # def loss():
-            #     return tf.reduce_sum((obs - w @ self.vars['x'][video]) ** 2)
+                    obs=lambda x, w:
+                        tfd.Independent(tfd.Normal(
+                            loc=tf.matmul(w, tf.expand_dims(x, -3)),
+                            scale=tf.expand_dims(tf.expand_dims(
+                                tf.gather(self.vars['subject_noise_scale'], subs), -1) * self.vars['roi_noise_scale'], -1)
+                        ), 3),
+                ))
+                return joint
+            
+            
+            w = tf.Variable(init_norm((obs.shape[0], self.q, self.p)), name=f'w_{name}')
+            rho = tf.Variable(init_norm((1,)), name=f'rho_{name}')
+            opt = tf.optimizers.Adam(learning_rate=learning_rate)
 
-            # @tf.function
-            # def train_step():
-            #     opt.minimize(loss, (w))
+            @tf.function
+            def loss():
+                return tf.reduce_sum((obs - w @ self.vars['x'][video]) ** 2)
 
-            # for i in range(int(n_iters)):
-            #     train_step()
+            @tf.function
+            def train_step():
+                opt.minimize(loss, (w))
+
+            for i in range(int(n_iters)):
+                train_step()
         
         if add_to_model:
             self.vars['w'] = tf.concat((self.vars['w'], w), axis=0, name='w_concat')
@@ -434,13 +438,17 @@ class SharedGpfa:
     def check_model_fit(self):
         assert self.t is not None, ".fit() has not been called yet."
 
-    def add_batch(self, data):
-        if type(data) is not list and data.ndim == 2:
-            data = [np.expand_dims(data, axis=0)]
-        if type(data) is not list and data.ndim == 3:
-            return [data]
-        else:
-            return data
+    def add_batch(self, data, element_len=3):
+        if element_len == 3:
+            if type(data) is not list and data.ndim == 2:
+                return [np.expand_dims(data, axis=0)]
+            if type(data) is not list and data.ndim == 3:
+                return [data]
+            else:
+                return data
+        elif element_len == 2:
+            if type(data) is not list and data.ndim == 2:
+                return [data]
 
     def len_scale(self, unit='TR', tr_to_sec=2):
         tau_tr = tf.convert_to_tensor(self.vars['length_scale']).numpy()
