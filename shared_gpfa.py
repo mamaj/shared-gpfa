@@ -226,7 +226,7 @@ class SharedGpfa:
                 self.update_tfsummary(loss(), epoch)
         return l
 
-    def add_video(self, obs, smoothness, sm_factor=None, n_iters=1e3, learning_rate=0.04, ls_init=True, name='new_x', tensorboard=False, desc='Adding Video', **kwargs):
+    def add_video(self, obs, smoothness=1, sm_factor=None, n_iters=1e3, learning_rate=0.04, ls_init=True, name='new_x', tensorboard=False, desc='Adding Video', **kwargs):
 
         if sm_factor is not None:
             smoothness = (self.m * self.q / self.p) / sm_factor
@@ -274,12 +274,16 @@ class SharedGpfa:
                         tf.summary.histogram(f'xlist{i}_1', x[1], step=epoch)
         return xlist
 
-    def add_video_subjects(self, obs, smoothness, n_iters=1e3, learning_rate=0.04, ls_init=True, subs=Ellipsis, name='new_x', tensorboard=False, desc='Adding Video', **kwargs):
+    def add_video_subjects(self, obs, smoothness=1, sm_factor=None, n_iters=1e3, learning_rate=0.04, ls_init=True, subs=Ellipsis, name='new_x', tensorboard=False, desc='Adding Video', **kwargs):
 
         if type(subs) is int:
             subs = [subs]
         obs = self.add_batch(obs)
-        # assert len(subs) == len(obs[0])
+        assert len(subs) == len(obs[0])
+        
+        if sm_factor is not None:
+            smoothness = (len(subs) * self.q / self.p) / sm_factor
+
 
         t = [x.shape[-1] for x in obs]
         new_joint = [self.create_joint_subjects(_t, subs=subs) for _t in t]
