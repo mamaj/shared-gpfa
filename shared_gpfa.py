@@ -64,66 +64,53 @@ class SharedGpfa:
         for t in self.t:
             self.joint.append(self.create_joint(t))
             
-    def create_joint(self, t):
-        ind_points = np.arange(t).astype(self.dtype)
+    def create_joint(self, t, m=None, p=None, q=None, length_scale=None, roi_noise_scale=None, subject_noise_scale=None, amplitude=None, latent_noise_var=None, dtype=None):
+        m = self.m if m is None
+        p = self.p if p is None
+        q = self.q if q is None
+        length_scale = self.vars['length_scale'] if length_scale is None
+        roi_noise_scale = self.vars['roi_noise_scale'] if roi_noise_scale is None
+        subject_noise_scale = self.vars['subject_noise_scale'] if subject_noise_scale is None
+        amplitude = self.amplitude if amplitude is None
+        latent_noise_var = self.latent_noise_var if latent_noise_var is None
+        dtype = self.dtype if dtype is None
+                
+        ind_points = np.arange(t).astype(dtype)
         joint = tfd.JointDistributionNamed(dict(
             x=tfd.Independent(
                 tfd.GaussianProcess(
                     kernel=tfp.math.psd_kernels.ExponentiatedQuadratic(
-                        amplitude=self.amplitude,
-                        length_scale=self.vars['length_scale'],
+                        amplitude=amplitude,
+                        length_scale=length_scale,
                         feature_ndims=1),
                     index_points=ind_points[:, None],
                     jitter=1e-5,
-                    observation_noise_variance=self.latent_noise_var,
+                    observation_noise_variance=latent_noise_var,
                     validate_args=True),
                 reinterpreted_batch_ndims=1),
             w=tfd.Independent(
                 tfd.Normal(
-                    loc=np.zeros((self.m, self.q, self.p), dtype=self.dtype),
-                    scale=1),
-                reinterpreted_batch_ndims=3),
-            obs=lambda x, w:
-                tfd.Independent(
-                    tfd.Normal(
-                        loc=tf.matmul(w, tf.expand_dims(x, -3)),
-                        scale=tf.expand_dims(tf.expand_dims(
-                            self.vars['subject_noise_scale'], -1) * self.vars['roi_noise_scale'], -1)),
-                reinterpreted_batch_ndims=3)
-        ))
-        return joint
-    
-    def create_joint_subjects(self, t, subs):
-        if subs is Ellipsis:
-            return self.create_joint(t)
-        elif type(subs) is int:
-            subs = [subs]
-        ind_points = np.arange(t).astype(self.dtype)
-        joint = tfd.JointDistributionNamed(dict(
-            x=tfd.Independent(
-                tfd.GaussianProcess(
-                    kernel=tfp.math.psd_kernels.ExponentiatedQuadratic(
-                        amplitude=self.amplitude,
-                        length_scale=self.vars['length_scale'],
-                        feature_ndims=1),
-                    index_points=ind_points[:, None],
-                    jitter=1e-5,
-                    observation_noise_variance=self.latent_noise_var,
-                    validate_args=True),
-                reinterpreted_batch_ndims=1),
-            w=tfd.Independent(
-                tfd.Normal(
-                    loc=np.zeros((len(subs), self.q, self.p), dtype=self.dtype),
+                    loc=np.zeros((m, q, p), dtype=dtype),
                     scale=1),
                 reinterpreted_batch_ndims=3),
             obs=lambda x, w:
                 tfd.Independent(tfd.Normal(
                     loc=tf.matmul(w, tf.expand_dims(x, -3)),
                     scale=tf.expand_dims(tf.expand_dims(
-                        tf.gather(self.vars['subject_noise_scale'], subs), -1) * self.vars['roi_noise_scale'], -1)
+                        subject_noise_scale, -1) * roi_noise_scale, -1)
                 ), 3),
         ))
         return joint
+
+    def create_joint_subjects(self, t, subs):
+        if subs is Ellipsis:
+            return self.create_joint(t)
+        elif type(subs) is int:
+            subs = [subs]
+            
+        m = len(subs)
+        subject_noise_scale = tf.gather(self.vars['subject_noise_scale'], subs)
+        return self.create_joint(t, m=m, subject_noise_scale=subject_noise_scale)
 
     def log_prob(self, data, joint=None, x=None, w=None):
         self.check_model_fit()
@@ -307,61 +294,57 @@ class SharedGpfa:
                         tf.summary.histogram(f'xlist{i}_0', x[0], step=epoch)
                         tf.summary.histogram(f'xlist{i}_1', x[1], step=epoch)
         return xlist
-
-    # needs a complete rewrite
-    def add_subject(self, obs, video=0, reg=1, solve_ls=True, add_to_model=False, n_iters=1e3, learning_rate=0.04, name='new_sub'):
-        if obs.ndim == 2:
-            obs = np.expand_dims(obs, 0)
-
+    
+    def add_subject(self, obs, video=Ellipsis, reg=1, add_to_model=False, solve_ls=False, n_iters=1e3, learning_rate=0.04, name='new_sub', tensorboard=False, desc='Adding new subject', **kwargs):
+        obs = self.add_batch(obs)
+        
         if solve_ls:
-            # w = obs @ np.linalg.pinv(self.vars['x'][video].numpy())
-            X = self.traj(video)
-            w = obs @ X.T @ np.linalg.inv((X @ X.T + reg * np.eye(self.p)))
-
+            obs = np.concatenate(obs, axis=-1)
+            x = self.traj(video)
+            w = obs @ x.T @ np.linalg.inv((x @ X.T + reg * np.eye(self.p)))
+            subject_noise_scale = [1.]
         else:
-            def init_norm(size):
-                return np.random.normal(size=size).astype(self.dtype)
-            
-            def joint_model(t):
-                ind_points = np.arange(t).astype(self.dtype)
-                joint = tfd.JointDistributionNamed(dict(
-                    w=tfd.Independent(
-                        tfd.Normal(
-                            loc=np.zeros((len(subs), self.q, self.p), dtype=self.dtype),
-                            scale=1),
-                        reinterpreted_batch_ndims=3),
+            nsubs = obs[0].shape[0]
+            if video is Ellipsis:
+                x = self.var['x']
+            elif type(video) is int:
+                x = self.var['x'][video]
+            elif type(video) is list:
+                x = [self.var['x'][v] for i in video]
+            else:
+                raise ValueError('input video should be Ellipsis, list of ints, or int')
 
-                    obs=lambda x, w:
-                        tfd.Independent(tfd.Normal(
-                            loc=tf.matmul(w, tf.expand_dims(x, -3)),
-                            scale=tf.expand_dims(tf.expand_dims(
-                                tf.gather(self.vars['subject_noise_scale'], subs), -1) * self.vars['roi_noise_scale'], -1)
-                        ), 3),
-                ))
-                return joint
-            
-            
-            w = tf.Variable(init_norm((obs.shape[0], self.q, self.p)), name=f'w_{name}')
-            rho = tf.Variable(init_norm((1,)), name=f'rho_{name}')
-            opt = tf.optimizers.Adam(learning_rate=learning_rate)
+            def init_uniform(size):
+                return np.random.uniform(size=size).astype(self.dtype)
+            def init_log(size):
+                return np.random.lognormal(size=size).astype(self.dtype)
+
+            constrain_positive = tfb.Shift(np.finfo(np.float32).tiny)(tfb.Exp())
+            w = tf.Variable(init_uniform((nsubs, self.q, self.p)), name=f'w_{name}')
+            subject_noise_scale = tfp.util.TransformedVariable(init_log(nsubs), constrain_positive, name=f'noise_scale_{name}')
+            joint = [self.create_joint(_obs.shape[-1], m=nsubs, subject_noise_scale=subject_noise_scale) for _obs in obs]
 
             @tf.function
             def loss():
-                return tf.reduce_sum((obs - w @ self.vars['x'][video]) ** 2)
+                return self.train_loss(obs, smoothness=0., reg=reg, joint=joint, x=x, w=w)
 
             @tf.function
             def train_step():
-                opt.minimize(loss, (w))
+                opt.minimize(loss, [w, subject_noise_scale])
 
-            for i in range(int(n_iters)):
+            for epoch in trange(int(n_iters), desc=desc, **kwargs):
                 train_step()
-        
+                if tensorboard:
+                    with self.summary_writer.as_default():
+                        for i, x in enumerate(x):
+                            tf.summary.histogram(f'new_w', w, step=epoch)
+                            tf.summary.scalar(f'new_sub_noise_scale', subject_noise_scale, step=epoch)
         if add_to_model:
             self.vars['w'] = tf.concat((self.vars['w'], w), axis=0, name='w_concat')
-            self.vars['subject_noise_scale'] = tf.concat((self.vars['subject_noise_scale'], [1]), axis=0, name='subject_noise_scale_concat')
+            self.vars['subject_noise_scale'] = tf.concat((self.vars['subject_noise_scale'], subject_noise_scale), axis=0, name='subject_noise_scale_concat')
             self.m += 1
             self.init_joint()
-        return w
+        return w, subject_noise_scale
     
     def factor_analysis(self, data, **kwargs):
         fa = FactorAnalysis(n_components=self.p, random_state=0, **kwargs)
